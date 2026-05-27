@@ -34,12 +34,38 @@ try:
 except ImportError:
     FASTMCP_AVAILABLE = False
 
+try:
+    import httpx
+    HTTPX_AVAILABLE = True
+except ImportError:
+    HTTPX_AVAILABLE = False
+
+
+# ---------------------------------------------------------------------------
+# Auth helper
+# ---------------------------------------------------------------------------
+
+def _parse_basic_auth(value: str):
+    """
+    Parse a USER:PASS string into an httpx.BasicAuth object.
+    Raises SystemExit with a clear message if the format is wrong or httpx
+    is unavailable.
+    """
+    if not HTTPX_AVAILABLE:
+        print("[ERROR] httpx is required for --basic-auth. Run: pip install httpx")
+        sys.exit(1)
+    if ":" not in value:
+        print("[ERROR] --basic-auth requires USER:PASS format (e.g. admin:secret)")
+        sys.exit(1)
+    user, _, password = value.partition(":")
+    return httpx.BasicAuth(user, password)
+
 
 # ---------------------------------------------------------------------------
 # One-shot helpers
 # ---------------------------------------------------------------------------
 
-async def _call_tool_once(url: str, tool_name: str, raw_args: str, timeout: float) -> None:  # noqa: ARG001
+async def _call_tool_once(url: str, tool_name: str, raw_args: str, timeout: float, auth=None) -> None:  # noqa: ARG001
     try:
         call_args = json.loads(raw_args) if raw_args else {}
     except json.JSONDecodeError as e:
@@ -53,7 +79,7 @@ async def _call_tool_once(url: str, tool_name: str, raw_args: str, timeout: floa
         print(json.dumps(call_args, indent=2))
 
     try:
-        client = Client(url)
+        client = Client(url, auth=auth)
         async with client:
             result = await client.call_tool(tool_name, call_args)
             render_tool_result(tool_name, result)
@@ -61,10 +87,10 @@ async def _call_tool_once(url: str, tool_name: str, raw_args: str, timeout: floa
         print_finding("HIGH", f"Call failed: {e}")
 
 
-async def _read_resource_once(url: str, uri: str) -> None:
+async def _read_resource_once(url: str, uri: str, auth=None) -> None:
     print_header(f"Reading resource {uri}")
     try:
-        client = Client(url)
+        client = Client(url, auth=auth)
         async with client:
             content = await client.read_resource(uri)
             render_resource_content(uri, content)
@@ -86,6 +112,9 @@ Modes of operation:
 
   Enumerate a server:
     mcpfox --url http://target:8080/mcp/
+
+  Enumerate with HTTP Basic Auth:
+    mcpfox --url http://target:8080/mcp/ --basic-auth admin:secret
 
   Enumerate then drop into interactive client (with Tab autocomplete):
     mcpfox --url http://target:8080/mcp/ --interact
@@ -112,6 +141,10 @@ Modes of operation:
     target.add_argument("--url", metavar="URL", help="MCP server URL to enumerate")
     target.add_argument("--timeout", type=float, default=5.0, metavar="SEC",
                         help="Connection/request timeout in seconds (default: 5)")
+    target.add_argument(
+        "--basic-auth", metavar="USER:PASS", dest="basic_auth",
+        help="HTTP Basic Auth credentials in USER:PASS format",
+    )
 
     enum_grp = parser.add_argument_group("Enumeration")
     enum_grp.add_argument("--read-resources", action="store_true",
@@ -163,13 +196,16 @@ async def _main(args: argparse.Namespace) -> None:
         print("No target specified. Use --help for usage.")
         sys.exit(1)
 
+    # Resolve auth object once — shared across all calls in this session
+    auth = _parse_basic_auth(args.basic_auth) if args.basic_auth else None
+
     # One-shot modes bypass full enumeration
     if args.url and args.call_tool:
-        await _call_tool_once(args.url, args.call_tool, args.args, args.timeout)
+        await _call_tool_once(args.url, args.call_tool, args.args, args.timeout, auth=auth)
         return
 
     if args.url and args.read_resource:
-        await _read_resource_once(args.url, args.read_resource)
+        await _read_resource_once(args.url, args.read_resource, auth=auth)
         return
 
     # Config discovery
@@ -188,6 +224,7 @@ async def _main(args: argparse.Namespace) -> None:
                         srv["url"],
                         read_resources=args.read_resources,
                         probe_prompts=args.prompts,
+                        auth=auth,
                     )
                     render_report(report, verbose=args.verbose)
                     all_reports.append(report)
@@ -196,7 +233,7 @@ async def _main(args: argparse.Namespace) -> None:
     if args.scan_host:
         ports = [int(p.strip()) for p in args.ports.split(",")] if args.ports else COMMON_MCP_PORTS
         print_header(f"Scanning {args.scan_host} on {len(ports)} ports")
-        results = await scan_ports(args.scan_host, ports, timeout=args.timeout)
+        results = await scan_ports(args.scan_host, ports, timeout=args.timeout, auth=auth)
         render_port_scan(results)
         for r in results:
             if r.get("is_sse") or r.get("status") == 200:
@@ -205,6 +242,7 @@ async def _main(args: argparse.Namespace) -> None:
                     r["url"],
                     read_resources=args.read_resources,
                     probe_prompts=args.prompts,
+                    auth=auth,
                 )
                 render_report(report, verbose=args.verbose)
                 all_reports.append(report)
@@ -215,6 +253,7 @@ async def _main(args: argparse.Namespace) -> None:
             args.url,
             read_resources=args.read_resources,
             probe_prompts=args.prompts,
+            auth=auth,
         )
         render_report(report, verbose=args.verbose)
         all_reports.append(report)
@@ -235,7 +274,7 @@ async def _main(args: argparse.Namespace) -> None:
         manifest: dict | None = None
         if args.download and output_dir is not None:
             print_section("Downloading resources")
-            manifest = await download_all_resources(args.url, report, output_dir)
+            manifest = await download_all_resources(args.url, report, output_dir, auth=auth)
             print_download_inventory(manifest)
 
         # HTML report
@@ -248,7 +287,7 @@ async def _main(args: argparse.Namespace) -> None:
                 print(f"\nHTML report -> {report_path}")
 
         if args.interact:
-            await interactive_session(args.url, report)
+            await interactive_session(args.url, report, auth=auth)
 
     # JSON output
     if args.json_output and all_reports:
